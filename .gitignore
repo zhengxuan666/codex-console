@@ -48,6 +48,8 @@ token_*.json
 .env
 .env.local
 *.local
+.snow/
+AGENTS.md
 
 # OS
 .DS_Store
