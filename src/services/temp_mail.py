@@ -179,6 +179,7 @@ class TempMailService(BaseEmailService):
             return False
 
         otp_keywords = (
+            "verification",
             "verification code",
             "verify",
             "one-time code",
