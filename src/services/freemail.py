@@ -184,6 +184,7 @@ class FreemailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        used_codes: Optional[set[str]] = None,
     ) -> Optional[str]:
         """
         从 Freemail 邮箱获取验证码

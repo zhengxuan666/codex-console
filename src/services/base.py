@@ -83,6 +83,7 @@ class BaseEmailService(abc.ABC):
         timeout: int = 120,
         pattern: str = r"(?<!\d)(\d{6})(?!\d)",
         otp_sent_at: Optional[float] = None,
+        used_codes: Optional[set[str]] = None,
     ) -> Optional[str]:
         """
         获取验证码
@@ -93,6 +94,7 @@ class BaseEmailService(abc.ABC):
             timeout: 超时时间（秒）
             pattern: 验证码正则表达式
             otp_sent_at: OTP 发送时间戳，用于过滤旧邮件
+            used_codes: 当前注册/登录流程中已成功使用过的验证码，服务可用它跳过重复验证码
 
         Returns:
             验证码字符串，如果超时或未找到返回 None

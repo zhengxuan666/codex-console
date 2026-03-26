@@ -304,6 +304,7 @@ class OutlookService(BaseEmailService):
         timeout: int = None,
         pattern: str = None,
         otp_sent_at: Optional[float] = None,
+        used_codes: Optional[set[str]] = None,
     ) -> Optional[str]:
         """
         从 Outlook 邮箱获取验证码

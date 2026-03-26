@@ -152,6 +152,7 @@ class RegistrationEngine:
         self._last_otp_validation_code: Optional[str] = None
         self._last_otp_validation_status_code: Optional[int] = None
         self._last_otp_validation_outcome: str = ""  # success/http_non_200/network_timeout/network_error
+        self._used_otp_codes: set[str] = set()  # 当前运行流程已成功使用的验证码，避免复用旧码
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -2114,6 +2115,7 @@ class RegistrationEngine:
                 timeout=fetch_timeout,
                 pattern=OTP_CODE_PATTERN,
                 otp_sent_at=self._otp_sent_at,
+                used_codes=self._used_otp_codes,
             )
 
             if code:
@@ -2195,7 +2197,13 @@ class RegistrationEngine:
                 except Exception as parse_err:
                     self._log(f"解析 OTP 校验返回信息失败: {parse_err}", "warning")
 
-            return response.status_code == 200
+                self._used_otp_codes.add(code)
+                self._log(
+                    f"验证码校验通过，已记录为本流程已使用验证码: {code}；当前累计 {len(self._used_otp_codes)} 个"
+                )
+                return True
+
+            return False
 
         except Exception as e:
             err_text = str(e or "").lower()
@@ -2638,6 +2646,7 @@ class RegistrationEngine:
             self._create_account_refresh_token = None
             self._last_validate_otp_continue_url = None
             self._last_validate_otp_workspace_id = None
+            self._used_otp_codes = set()
 
             self._log("=" * 60)
             self._log("注册流程启动，开始替你敲门")

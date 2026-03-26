@@ -82,7 +82,6 @@ class OutlookBatchImportResponse(BaseModel):
 
 
 # ============== Helper Functions ==============
-
 # 敏感字段列表，返回响应时需要过滤
 SENSITIVE_FIELDS = {
     'password',
@@ -91,7 +90,9 @@ SENSITIVE_FIELDS = {
     'access_token',
     'admin_token',
     'admin_password',
+    'site_password',
     'custom_auth',
+    'x_custom_auth',
 }
 
 def filter_sensitive_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -218,7 +219,7 @@ async def get_service_types():
                 "config_fields": [
                     {"name": "base_url", "label": "Worker 地址", "required": True, "placeholder": "https://mail.example.com"},
                     {"name": "admin_password", "label": "Admin 密码", "required": True, "secret": True},
-                    {"name": "custom_auth", "label": "Custom Auth（可选）", "required": False, "secret": True},
+                    {"name": "site_password", "label": "站点访问密码", "required": False, "secret": True, "placeholder": "可选：私有站点密码（x-custom-auth）"},
                     {"name": "domain", "label": "邮箱域名", "required": True, "placeholder": "example.com"},
                     {"name": "enable_prefix", "label": "启用前缀", "required": False, "default": True},
                 ]
@@ -258,7 +259,6 @@ async def get_service_types():
             }
         ]
     }
-
 
 @router.get("", response_model=EmailServiceListResponse)
 async def list_email_services(

@@ -121,6 +121,7 @@ class ImapMailService(BaseEmailService):
         timeout: int = 60,
         pattern: str = None,
         otp_sent_at: Optional[float] = None,
+        used_codes: Optional[set[str]] = None,
     ) -> Optional[str]:
         """轮询 IMAP 收件箱，获取 OpenAI 验证码"""
         start_time = time.time()

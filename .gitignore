@@ -33,6 +33,8 @@ uv.lock
 *.swp
 *.swo
 *~
+.snow/
+AGENTS.md
 
 # Data and Logs
 data/

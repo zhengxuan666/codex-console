@@ -70,11 +70,20 @@ class FakeEmailService(BaseEmailService):
             "service_id": "mailbox-1",
         }
 
-    def get_verification_code(self, email, email_id=None, timeout=120, pattern=r"(?<!\d)(\d{6})(?!\d)", otp_sent_at=None):
+    def get_verification_code(
+        self,
+        email,
+        email_id=None,
+        timeout=120,
+        pattern=r"(?<!\d)(\d{6})(?!\d)",
+        otp_sent_at=None,
+        used_codes=None,
+    ):
         self.otp_requests.append({
             "email": email,
             "email_id": email_id,
             "otp_sent_at": otp_sent_at,
+            "used_codes": set(used_codes or set()),
         })
         if not self.codes:
             raise AssertionError("no verification code queued")
@@ -243,6 +252,8 @@ def test_run_registers_then_relogs_to_fetch_token():
     assert fake_oauth.start_calls == 2
     assert len(email_service.otp_requests) == 2
     assert all(item["otp_sent_at"] is not None for item in email_service.otp_requests)
+    assert email_service.otp_requests[0]["used_codes"] == set()
+    assert email_service.otp_requests[1]["used_codes"] == {"123456"}
     assert sum(1 for call in session_one.calls if call["url"] == OPENAI_API_ENDPOINTS["send_otp"]) == 1
     assert sum(1 for call in session_two.calls if call["url"] == OPENAI_API_ENDPOINTS["send_otp"]) == 0
     assert sum(1 for call in session_one.calls if call["url"] == OPENAI_API_ENDPOINTS["select_workspace"]) == 0

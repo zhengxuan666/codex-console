@@ -41,10 +41,11 @@ class TempMailService(BaseEmailService):
                 - base_url: Worker 域名地址，如 https://mail.example.com (必需)
                 - admin_password: Admin 密码，对应 x-admin-auth header (必需)
                 - domain: 邮箱域名，如 example.com (必需)
+                - site_password: 可选站点访问密码，对应 x-custom-auth header
                 - enable_prefix: 是否启用前缀，默认 True
                 - timeout: 请求超时时间，默认 30
                 - max_retries: 最大重试次数，默认 3
-            name: 服务名称
+
         """
         super().__init__(EmailServiceType.TEMP_MAIL, name)
 
@@ -209,17 +210,36 @@ class TempMailService(BaseEmailService):
 
         return None, False
 
-    def _admin_headers(self) -> Dict[str, str]:
-        """构造 admin 请求头"""
+    def _mail_timestamp(self, mail: Dict[str, Any]) -> float:
+        """提取邮件时间戳，统一转换为浮点秒；缺失时返回 0。"""
+        return float(self._extract_mail_timestamp(mail) or 0.0)
+
+    def _site_password(self) -> str:
+        """获取可选站点访问密码，兼容历史/别名配置键。"""
+        return str(
+            self.config.get("site_password")
+            or self.config.get("custom_auth")
+            or self.config.get("x_custom_auth")
+            or ""
+        ).strip()
+
+    def _default_headers(self) -> Dict[str, str]:
+        """构造通用 JSON 请求头，并按需附加站点访问密码。"""
         headers = {
-            "x-admin-auth": self.config["admin_password"],
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        custom_auth = (self.config.get("custom_auth") or "").strip()
-        if custom_auth:
-            headers["x-custom-auth"] = custom_auth
+        site_password = self._site_password()
+        if site_password:
+            headers["x-custom-auth"] = site_password
         return headers
+
+    def _admin_headers(self) -> Dict[str, str]:
+        """构造 admin 请求头"""
+        return {
+            **self._default_headers(),
+            "x-admin-auth": self.config["admin_password"],
+        }
 
     def _extract_mails_from_response(self, response: Any) -> List[Dict[str, Any]]:
         """
@@ -502,9 +522,13 @@ class TempMailService(BaseEmailService):
         base_url = self.config["base_url"].rstrip("/")
         url = f"{base_url}{path}"
 
-        # 合并默认 admin headers
+        # 合并默认 JSON headers；admin API 额外注入 x-admin-auth，所有请求按需附加 x-custom-auth
         kwargs.setdefault("headers", {})
-        for k, v in self._admin_headers().items():
+        default_headers = self._default_headers()
+        if path == "/admin" or path.startswith("/admin/"):
+            default_headers = self._admin_headers()
+
+        for k, v in default_headers.items():
             kwargs["headers"].setdefault(k, v)
 
         try:
@@ -603,6 +627,7 @@ class TempMailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        used_codes: Optional[set[str]] = None,
     ) -> Optional[str]:
         """
         从 TempMail 邮箱获取验证码
@@ -612,7 +637,8 @@ class TempMailService(BaseEmailService):
             email_id: 未使用，保留接口兼容
             timeout: 超时时间（秒）
             pattern: 验证码正则
-            otp_sent_at: OTP 发送时间戳（用于过滤旧邮件）
+            otp_sent_at: OTP 发送时间戳，用于过滤明显早于本轮发送时间的旧邮件
+            used_codes: 当前注册/登录流程中已成功使用过的验证码，命中后应继续等待新码
 
         Returns:
             验证码字符串，超时返回 None
@@ -620,11 +646,17 @@ class TempMailService(BaseEmailService):
         logger.info(f"正在从 TempMail 邮箱 {email} 获取验证码...")
 
         start_time = time.time()
-        seen_mail_ids: set = set()
+        poll_round = 0
+        seen_mail_keys: set[str] = set()
         last_used_mail_id = self._last_used_mail_ids.get(email)
         unknown_ts_grace_seconds = 15
+        min_timestamp = (otp_sent_at - 60) if otp_sent_at else 0.0
+        used_codes_set = {
+            str(code).strip()
+            for code in (used_codes or set())
+            if str(code).strip()
+        }
 
-        # 优先使用用户级 JWT，回退到 admin API
         cached = self._email_cache.get(email, {})
         jwt = cached.get("jwt")
         address_id = (
@@ -632,134 +664,282 @@ class TempMailService(BaseEmailService):
             or str(email_id or "").strip()
             or None
         )
-        poll_count = 0
+
+        logger.info(
+            "TempMail 验证码轮询已启动: email=%s, has_jwt=%s, otp_sent_at=%s, used_code_count=%s",
+            email,
+            bool(jwt),
+            otp_sent_at,
+            len(used_codes_set),
+        )
+
+        def _extract_results(response: Any, source_label: str) -> List[Dict[str, Any]]:
+            mails = self._extract_mails_from_response(response)
+            logger.info(f"TempMail {source_label} 返回 {len(mails)} 封邮件")
+            return mails
+
+        def _fetch_user_mails() -> Tuple[str, List[Dict[str, Any]]]:
+            user_attempts = [
+                (
+                    "/api/mails",
+                    {"limit": 20, "offset": 0},
+                    {
+                        "Authorization": f"Bearer {jwt}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    "Bearer /api/mails",
+                ),
+                (
+                    "/user_api/mails",
+                    {"limit": 20, "offset": 0, "address": email},
+                    {
+                        "x-user-token": jwt,
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    "x-user-token /user_api/mails",
+                ),
+            ]
+
+            last_error: Optional[Exception] = None
+            for path, params, headers, label in user_attempts:
+                try:
+                    response = self._make_request("GET", path, params=params, headers=headers)
+                    source_label = f"用户接口 {label}"
+                    return source_label, _extract_results(response, source_label)
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(f"TempMail 用户接口 {label} 调用失败: {exc}")
+
+            if last_error:
+                raise last_error
+
+            return "用户接口", []
+
+        def _fetch_admin_mail_sources() -> List[Tuple[str, List[Dict[str, Any]]]]:
+            attempts: List[Tuple[Dict[str, Any], str, bool]] = [
+                (
+                    {"limit": 20, "offset": 0, "address": email},
+                    "admin 接口 /admin/mails[address=email]",
+                    False,
+                ),
+            ]
+            if address_id and address_id != email:
+                attempts.append(
+                    (
+                        {"limit": 20, "offset": 0, "address": address_id},
+                        "admin 接口 /admin/mails[address=address_id]",
+                        False,
+                    )
+                )
+            attempts.append(
+                (
+                    {"limit": 120, "offset": 0},
+                    "admin 接口 /admin/mails[all]",
+                    True,
+                )
+            )
+
+            sources: List[Tuple[str, List[Dict[str, Any]]]] = []
+            for params, label, needs_filter in attempts:
+                try:
+                    response = self._make_request("GET", "/admin/mails", params=params)
+                    mails = _extract_results(response, label)
+                    if needs_filter:
+                        mails = [mail for mail in mails if self._mail_appears_for_email(mail, email)]
+                        logger.info(f"TempMail {label} 过滤后剩余 {len(mails)} 封邮件")
+                    sources.append((label, mails))
+                except Exception as exc:
+                    logger.warning(f"TempMail {label} 调用失败: {exc}")
+            return sources
+
+        def _scan_mails_for_code(
+            mails: List[Dict[str, Any]],
+            source_label: str,
+        ) -> Tuple[str, Optional[str]]:
+            candidates: List[Dict[str, Any]] = []
+            unknown_ts_candidates: List[Dict[str, Any]] = []
+            sorted_mails = sorted(
+                mails,
+                key=lambda mail: self._mail_timestamp(mail),
+                reverse=True,
+            )
+
+            for mail in sorted_mails:
+                mail_id = self._extract_mail_id(mail)
+                if not mail_id:
+                    logger.debug(f"TempMail {source_label} 跳过缺少 id 的邮件")
+                    continue
+
+                mail_key = f"{source_label}:{mail_id}"
+                if mail_key in seen_mail_keys:
+                    logger.debug(f"TempMail {source_label} 跳过已检查邮件: {mail_id}")
+                    continue
+                seen_mail_keys.add(mail_key)
+
+                if last_used_mail_id and mail_id == last_used_mail_id:
+                    logger.debug(f"TempMail {source_label} 跳过上次已使用邮件: {mail_id}")
+                    continue
+
+                mail_ts = self._extract_mail_timestamp(mail)
+                if min_timestamp and mail_ts and mail_ts + 1 < min_timestamp:
+                    logger.info(
+                        "TempMail %s 跳过旧邮件: id=%s, mail_ts=%s, min_timestamp=%s",
+                        source_label,
+                        mail_id,
+                        mail_ts,
+                        min_timestamp,
+                    )
+                    continue
+
+                parsed = self._extract_mail_fields(mail)
+                sender = parsed["sender"].lower()
+                subject = parsed["subject"]
+                body_text = parsed["body"]
+                raw_text = parsed["raw"]
+                content = f"{sender}\n{subject}\n{body_text}\n{raw_text}".strip()
+
+                if not self._is_openai_otp_mail(sender, subject, body_text, raw_text):
+                    continue
+
+                code, semantic_hit = self._extract_otp_code(content, pattern)
+                if not code:
+                    detail = self._fetch_mail_detail(mail_id=mail_id, jwt=jwt)
+                    if detail:
+                        detail_parsed = self._extract_mail_fields(detail)
+                        detail_ts = self._extract_mail_timestamp(detail)
+                        if detail_ts is not None:
+                            mail_ts = detail_ts
+                        if min_timestamp and mail_ts and mail_ts + 1 < min_timestamp:
+                            logger.info(
+                                "TempMail %s 详情邮件仍早于阈值: id=%s, mail_ts=%s, min_timestamp=%s",
+                                source_label,
+                                mail_id,
+                                mail_ts,
+                                min_timestamp,
+                            )
+                            continue
+                        detail_content = (
+                            f"{detail_parsed['sender']}\n"
+                            f"{detail_parsed['subject']}\n"
+                            f"{detail_parsed['body']}\n"
+                            f"{detail_parsed['raw']}"
+                        ).strip()
+                        if not self._is_openai_otp_mail(
+                            detail_parsed["sender"],
+                            detail_parsed["subject"],
+                            detail_parsed["body"],
+                            detail_parsed["raw"],
+                        ):
+                            continue
+                        code, semantic_hit = self._extract_otp_code(detail_content, pattern)
+
+                if not code:
+                    continue
+
+                code = str(code).strip()
+                if not code:
+                    continue
+                if code in used_codes_set:
+                    logger.info(
+                        "TempMail %s 跳过本流程已使用验证码: id=%s, code=%s",
+                        source_label,
+                        mail_id,
+                        code,
+                    )
+                    continue
+
+                candidate = {
+                    "mail_id": mail_id,
+                    "code": code,
+                    "mail_ts": mail_ts,
+                    "semantic_hit": bool(semantic_hit),
+                    "is_recent": bool(
+                        otp_sent_at and (mail_ts is not None) and (mail_ts + 2 >= otp_sent_at)
+                    ),
+                }
+                if otp_sent_at and mail_ts is None:
+                    unknown_ts_candidates.append(candidate)
+                else:
+                    candidates.append(candidate)
+
+            elapsed = time.time() - start_time
+            if otp_sent_at and (not candidates) and unknown_ts_candidates and elapsed < unknown_ts_grace_seconds:
+                logger.debug(
+                    "TempMail 轮询[%s]: 存在无时间戳邮件，等待 %.0fs 后再回退使用",
+                    email,
+                    unknown_ts_grace_seconds,
+                )
+                return "wait", None
+
+            all_candidates = candidates + unknown_ts_candidates
+            if not all_candidates:
+                return "none", None
+
+            best = sorted(
+                all_candidates,
+                key=lambda item: (
+                    1 if item.get("is_recent") else 0,
+                    1 if item.get("mail_ts") is not None else 0,
+                    float(item.get("mail_ts") or 0.0),
+                    1 if item.get("semantic_hit") else 0,
+                ),
+                reverse=True,
+            )[0]
+            code = str(best["code"])
+            self._last_used_mail_ids[email] = str(best["mail_id"])
+            logger.info(
+                "从 TempMail 邮箱 %s 找到验证码: %s（mail_id=%s ts=%s semantic=%s 来源=%s）",
+                email,
+                code,
+                best["mail_id"],
+                best.get("mail_ts"),
+                best.get("semantic_hit"),
+                source_label,
+            )
+            self.update_status(True)
+            return "found", code
 
         while time.time() - start_time < timeout:
-            poll_count += 1
+            poll_round += 1
             try:
-                mails = self._fetch_mails_once(email=email, jwt=jwt, email_id=address_id)
-                if not mails:
-                    if poll_count == 1 or poll_count % 5 == 0:
-                        logger.info(
-                            f"TempMail 轮询[{email}] 第 {poll_count} 次: 暂无邮件（已等待 {int(time.time() - start_time)}s）"
-                        )
-                    time.sleep(3)
-                    continue
+                logger.info(f"TempMail 开始第 {poll_round} 轮轮询: {email}")
 
-                if poll_count == 1 or poll_count % 3 == 0:
-                    logger.info(
-                        f"TempMail 轮询[{email}] 第 {poll_count} 次: 收到 {len(mails)} 封候选邮件"
-                    )
-
-                candidates: List[Dict[str, Any]] = []
-                unknown_ts_candidates: List[Dict[str, Any]] = []
-
-                for mail in mails:
-                    mail_id = self._extract_mail_id(mail)
-                    if mail_id in seen_mail_ids:
-                        continue
-
-                    if last_used_mail_id and mail_id == last_used_mail_id:
-                        continue
-
-                    seen_mail_ids.add(mail_id)
-
-                    # 过滤发送验证码之前的旧邮件，避免取到上一轮 OTP
-                    mail_ts = self._extract_mail_timestamp(mail)
-                    if otp_sent_at:
-                        if mail_ts is not None and mail_ts + 2 < otp_sent_at:
+                if jwt:
+                    try:
+                        user_source_label, user_mails = _fetch_user_mails()
+                        user_status, user_code = _scan_mails_for_code(user_mails, user_source_label)
+                        if user_status == "found":
+                            return user_code
+                        if user_status == "wait":
+                            time.sleep(3)
                             continue
+                        if user_mails:
+                            logger.info(f"TempMail {user_source_label} 未命中验证码，继续检查 admin 接口")
+                        else:
+                            logger.info(f"TempMail {user_source_label} 返回空结果，继续检查 admin 接口")
+                    except Exception as user_exc:
+                        logger.warning(f"TempMail 用户接口查询失败，将回退 admin 接口: {user_exc}")
+                else:
+                    logger.info(f"TempMail 邮箱 {email} 没有可用 JWT，直接检查 admin 接口")
 
-                    parsed = self._extract_mail_fields(mail)
-                    sender = parsed["sender"].lower()
-                    subject = parsed["subject"]
-                    body_text = parsed["body"]
-                    raw_text = parsed["raw"]
-                    content = f"{sender}\n{subject}\n{body_text}\n{raw_text}".strip()
+                admin_sources = _fetch_admin_mail_sources()
+                admin_wait = False
+                for admin_source_label, admin_mails in admin_sources:
+                    admin_status, admin_code = _scan_mails_for_code(admin_mails, admin_source_label)
+                    if admin_status == "found":
+                        return admin_code
+                    if admin_status == "wait":
+                        admin_wait = True
+                        break
+                    logger.info(f"TempMail {admin_source_label} 本轮未命中验证码")
 
-                    # 只处理 OpenAI 验证码类邮件（避免误命中通知类邮件）
-                    if not self._is_openai_otp_mail(sender, subject, body_text, raw_text):
-                        continue
-
-                    code, semantic_hit = self._extract_otp_code(content, pattern)
-                    if not code:
-                        # 部分部署列表接口只含摘要；尝试拉单封详情再匹配一次。
-                        detail = self._fetch_mail_detail(mail_id=mail_id, jwt=jwt)
-                        if detail:
-                            detail_parsed = self._extract_mail_fields(detail)
-                            detail_ts = self._extract_mail_timestamp(detail)
-                            if detail_ts is not None:
-                                mail_ts = detail_ts
-                            detail_content = (
-                                f"{detail_parsed['sender']}\n"
-                                f"{detail_parsed['subject']}\n"
-                                f"{detail_parsed['body']}\n"
-                                f"{detail_parsed['raw']}"
-                            ).strip()
-                            if not self._is_openai_otp_mail(
-                                detail_parsed["sender"],
-                                detail_parsed["subject"],
-                                detail_parsed["body"],
-                                detail_parsed["raw"],
-                            ):
-                                continue
-                            code, semantic_hit = self._extract_otp_code(detail_content, pattern)
-
-                    if not code:
-                        continue
-
-                    candidate = {
-                        "mail_id": mail_id,
-                        "code": code,
-                        "mail_ts": mail_ts,
-                        "semantic_hit": bool(semantic_hit),
-                        "is_recent": bool(
-                            otp_sent_at and (mail_ts is not None) and (mail_ts + 2 >= otp_sent_at)
-                        ),
-                    }
-                    if otp_sent_at and mail_ts is None:
-                        unknown_ts_candidates.append(candidate)
-                    else:
-                        candidates.append(candidate)
-
-                elapsed = time.time() - start_time
-                if otp_sent_at and (not candidates) and unknown_ts_candidates and elapsed < unknown_ts_grace_seconds:
-                    # 先等一小段时间，优先等待可解析时间戳的新邮件，避免立刻捞到历史旧码。
-                    logger.debug(
-                        "TempMail 轮询[%s]: 存在无时间戳邮件，等待 %.0fs 后再回退使用",
-                        email,
-                        unknown_ts_grace_seconds,
-                    )
+                if admin_wait:
                     time.sleep(3)
                     continue
-
-                all_candidates = candidates + unknown_ts_candidates
-                if all_candidates:
-                    best = sorted(
-                        all_candidates,
-                        key=lambda item: (
-                            1 if item.get("is_recent") else 0,
-                            1 if item.get("mail_ts") is not None else 0,
-                            float(item.get("mail_ts") or 0.0),
-                            1 if item.get("semantic_hit") else 0,
-                        ),
-                        reverse=True,
-                    )[0]
-                    code = str(best["code"])
-                    self._last_used_mail_ids[email] = str(best["mail_id"])
-                    logger.info(
-                        "从 TempMail 邮箱 %s 找到验证码: %s（mail_id=%s ts=%s semantic=%s）",
-                        email,
-                        code,
-                        best["mail_id"],
-                        best.get("mail_ts"),
-                        best.get("semantic_hit"),
-                    )
-                    self.update_status(True)
-                    return code
-
             except Exception as e:
-                logger.debug(f"检查 TempMail 邮件时出错: {e}")
+                logger.warning(f"检查 TempMail 邮件时出错: {e}")
 
             time.sleep(3)
 

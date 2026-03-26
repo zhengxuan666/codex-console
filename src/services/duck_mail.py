@@ -235,6 +235,7 @@ class DuckMailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        used_codes: Optional[set[str]] = None,
     ) -> Optional[str]:
         account_info = self._get_account_info(email=email, email_id=email_id)
         if not account_info:
