@@ -3,6 +3,7 @@
 从 main.py 中提取并重构的注册流程
 """
 
+import asyncio
 import re
 import json
 import time
@@ -16,6 +17,7 @@ from datetime import datetime
 
 from curl_cffi import requests as cffi_requests
 
+from .anyauto.register_flow import AnyAutoRegistrationEngine
 from .openai.oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient, HTTPClientError
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
@@ -27,6 +29,7 @@ from ..config.constants import (
     generate_random_user_info,
     OTP_CODE_PATTERN,
     DEFAULT_PASSWORD_LENGTH,
+    PASSWORD_SPECIAL_CHARSET,
     PASSWORD_CHARSET,
     AccountStatus,
     TaskStatus,
@@ -35,6 +38,10 @@ from ..config.settings import get_settings
 
 
 logger = logging.getLogger(__name__)
+
+
+class RegistrationCancelledError(asyncio.CancelledError):
+    """注册任务收到取消请求时抛出的协作式取消异常。"""
 
 
 @dataclass
@@ -96,7 +103,8 @@ class RegistrationEngine:
         email_service: BaseEmailService,
         proxy_url: Optional[str] = None,
         callback_logger: Optional[Callable[[str], None]] = None,
-        task_uuid: Optional[str] = None
+        task_uuid: Optional[str] = None,
+        check_cancelled: Optional[Callable[[], bool]] = None,
     ):
         """
         初始化注册引擎
@@ -106,11 +114,13 @@ class RegistrationEngine:
             proxy_url: 代理 URL
             callback_logger: 日志回调函数
             task_uuid: 任务 UUID（用于数据库记录）
+            check_cancelled: 取消检查回调（返回 True 表示任务应尽快停止）
         """
         self.email_service = email_service
         self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
+        self._check_cancelled = check_cancelled or (lambda: False)
 
         # 创建 HTTP 客户端
         self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
@@ -152,6 +162,24 @@ class RegistrationEngine:
         self._last_otp_validation_code: Optional[str] = None
         self._last_otp_validation_status_code: Optional[int] = None
         self._last_otp_validation_outcome: str = ""  # success/http_non_200/network_timeout/network_error
+
+    def _is_cancel_requested(self) -> bool:
+        try:
+            return bool(self._check_cancelled())
+        except Exception:
+            return False
+
+    def _raise_if_cancelled(self, reason: str = "任务已取消") -> None:
+        if self._is_cancel_requested():
+            raise RegistrationCancelledError(reason)
+
+    def _sleep_interruptible(self, seconds: float) -> None:
+        remaining = max(0.0, float(seconds or 0.0))
+        while remaining > 0:
+            self._raise_if_cancelled("任务在等待重试阶段被取消")
+            chunk = min(0.2, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -345,10 +373,20 @@ class RegistrationEngine:
 
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
         """生成随机密码"""
-        return ''.join(secrets.choice(PASSWORD_CHARSET) for _ in range(length))
+        length = max(8, int(length or DEFAULT_PASSWORD_LENGTH))
+        password_chars = [
+            secrets.choice(string.ascii_lowercase),
+            secrets.choice(string.ascii_uppercase),
+            secrets.choice(string.digits),
+            secrets.choice(PASSWORD_SPECIAL_CHARSET),
+        ]
+        password_chars.extend(secrets.choice(PASSWORD_CHARSET) for _ in range(length - len(password_chars)))
+        secrets.SystemRandom().shuffle(password_chars)
+        return ''.join(password_chars)
 
     def _check_ip_location(self) -> Tuple[bool, Optional[str]]:
         """检查 IP 地理位置"""
+        self._raise_if_cancelled("任务已取消，跳过 IP 地理位置检查")
         try:
             return self.http_client.check_ip_location()
         except Exception as e:
@@ -357,6 +395,7 @@ class RegistrationEngine:
 
     def _create_email(self) -> bool:
         """创建邮箱"""
+        self._raise_if_cancelled("任务已取消，跳过邮箱创建")
         try:
             self._log(f"正在创建 {self.email_service.service_type.value} 邮箱，先给新账号整个收件箱...")
             self.email_info = self.email_service.create_email()
@@ -385,6 +424,7 @@ class RegistrationEngine:
 
     def _start_oauth(self) -> bool:
         """开始 OAuth 流程"""
+        self._raise_if_cancelled("任务已取消，跳过 OAuth 初始化")
         try:
             self._log("开始 OAuth 授权流程，去门口刷个脸...")
             self.oauth_start = self.oauth_manager.start_oauth()
@@ -396,6 +436,7 @@ class RegistrationEngine:
 
     def _init_session(self) -> bool:
         """初始化会话"""
+        self._raise_if_cancelled("任务已取消，跳过会话初始化")
         try:
             self.session = self.http_client.session
             return True
@@ -405,11 +446,13 @@ class RegistrationEngine:
 
     def _get_device_id(self) -> Optional[str]:
         """获取 Device ID"""
+        self._raise_if_cancelled("任务已取消，停止获取 Device ID")
         if not self.oauth_start:
             return None
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
+            self._raise_if_cancelled("任务已取消，停止获取 Device ID")
             try:
                 if not self.session:
                     self.session = self.http_client.session
@@ -449,7 +492,7 @@ class RegistrationEngine:
                 )
 
             if attempt < max_attempts:
-                time.sleep(attempt)
+                self._sleep_interruptible(attempt)
                 self.http_client.close()
                 self.session = self.http_client.session
 
@@ -465,6 +508,7 @@ class RegistrationEngine:
 
     def _check_sentinel(self, did: str) -> Optional[str]:
         """检查 Sentinel 拦截"""
+        self._raise_if_cancelled("任务已取消，停止 Sentinel 检查")
         try:
             sen_token = self.http_client.check_sentinel(did)
             if sen_token:
@@ -497,6 +541,7 @@ class RegistrationEngine:
         current_did = str(did or "").strip()
         current_sen_token = str(sen_token or "").strip() if sen_token else None
         for attempt in range(1, max_attempts + 1):
+            self._raise_if_cancelled("任务已取消，停止提交授权入口")
             try:
                 request_body = json.dumps({
                     "username": {
@@ -536,7 +581,7 @@ class RegistrationEngine:
                         f"{log_label}命中限流 429（第 {attempt}/{max_attempts} 次），{wait_seconds}s 后自动重试...",
                         "warning",
                     )
-                    time.sleep(wait_seconds)
+                    self._sleep_interruptible(wait_seconds)
                     continue
 
                 # 部分网络/会话边界情况下会返回 409，做自愈重试而非直接失败。
@@ -560,7 +605,7 @@ class RegistrationEngine:
                             self.session.get(str(self.oauth_start.auth_url), timeout=12)
                     except Exception:
                         pass
-                    time.sleep(wait_seconds)
+                    self._sleep_interruptible(wait_seconds)
                     continue
 
                 if response.status_code != 200:
@@ -603,7 +648,7 @@ class RegistrationEngine:
                         f"{log_label}异常（第 {attempt}/{max_attempts} 次）: {e}，准备重试...",
                         "warning",
                     )
-                    time.sleep(2 * attempt)
+                    self._sleep_interruptible(2 * attempt)
                     continue
                 self._log(f"{log_label}失败: {e}", "error")
                 return SignupFormResult(success=False, error_message=str(e))
@@ -640,6 +685,7 @@ class RegistrationEngine:
 
     def _submit_login_password(self) -> SignupFormResult:
         """提交登录密码，进入邮箱验证码页面。"""
+        self._raise_if_cancelled("任务已取消，停止提交登录密码")
         max_attempts = 3
         password_text = str(self.password or "").strip()
         if not password_text and self.email:
@@ -661,6 +707,7 @@ class RegistrationEngine:
             )
 
         for attempt in range(1, max_attempts + 1):
+            self._raise_if_cancelled("任务已取消，停止登录密码重试")
             try:
                 response = self.session.post(
                     OPENAI_API_ENDPOINTS["password_verify"],
@@ -680,7 +727,7 @@ class RegistrationEngine:
                         f"提交登录密码命中限流 429（第 {attempt}/{max_attempts} 次），{wait_seconds}s 后自动重试...",
                         "warning",
                     )
-                    time.sleep(wait_seconds)
+                    self._sleep_interruptible(wait_seconds)
                     continue
 
                 if response.status_code == 401 and attempt < max_attempts:
@@ -692,7 +739,7 @@ class RegistrationEngine:
                             f"疑似密码尚未生效或历史账号密码不一致，{wait_seconds}s 后自动重试...",
                             "warning",
                         )
-                        time.sleep(wait_seconds)
+                        self._sleep_interruptible(wait_seconds)
                         continue
 
                 if response.status_code != 200:
@@ -723,7 +770,7 @@ class RegistrationEngine:
                         f"提交登录密码异常（第 {attempt}/{max_attempts} 次）: {e}，准备重试...",
                         "warning",
                     )
-                    time.sleep(2 * attempt)
+                    self._sleep_interruptible(2 * attempt)
                     continue
                 self._log(f"提交登录密码失败: {e}", "error")
                 return SignupFormResult(success=False, error_message=str(e))
@@ -740,6 +787,7 @@ class RegistrationEngine:
 
     def _prepare_authorize_flow(self, label: str) -> Tuple[Optional[str], Optional[str]]:
         """初始化当前阶段的授权流程，返回 device id 和 sentinel token。"""
+        self._raise_if_cancelled(f"任务已取消，停止执行 {label}")
         self._log(f"{label}: 先把会话热热身...")
         if not self._init_session():
             return None, None
@@ -2057,6 +2105,41 @@ class RegistrationEngine:
             self._last_register_password_error = str(e)
             return False, None
 
+    def _register_password_with_retry(
+        self,
+        did: Optional[str] = None,
+        sen_token: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Retry password registration when OpenAI returns a generic recoverable 400."""
+        self._raise_if_cancelled("任务已取消，停止密码注册重试")
+        max_attempts = 3
+        retryable_markers = (
+            "failed to create account",
+            "create account",
+            "invalid_request_error",
+            "http 400",
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            self._raise_if_cancelled("任务已取消，停止密码注册重试")
+            success, password = self._register_password(did, sen_token)
+            if success:
+                return True, password
+
+            error_text = str(self._last_register_password_error or "").strip().lower()
+            if attempt >= max_attempts:
+                break
+            if not any(marker in error_text for marker in retryable_markers):
+                break
+
+            self._log(
+                f"密码注册命中可重试 400，准备重新生成密码后重试 ({attempt}/{max_attempts})...",
+                "warning",
+            )
+            self._sleep_interruptible(min(2 * attempt, 4))
+
+        return False, None
+
     def _mark_email_as_registered(self):
         """标记邮箱为已注册状态（用于防止重复尝试）"""
         try:
@@ -2080,6 +2163,7 @@ class RegistrationEngine:
 
     def _send_verification_code(self, referer: Optional[str] = None) -> bool:
         """发送验证码"""
+        self._raise_if_cancelled("任务已取消，停止发送验证码")
         try:
             # 记录发送时间戳
             self._otp_sent_at = time.time()
@@ -2102,6 +2186,7 @@ class RegistrationEngine:
 
     def _get_verification_code(self, timeout: Optional[int] = None) -> Optional[str]:
         """获取验证码"""
+        self._raise_if_cancelled("任务已取消，停止拉取验证码")
         try:
             mailbox_email = str(self.inbox_email or self.email or "").strip()
             self._log(f"正在等待邮箱 {mailbox_email} 的验证码...")
@@ -2129,6 +2214,7 @@ class RegistrationEngine:
 
     def _validate_verification_code(self, code: str) -> bool:
         """验证验证码"""
+        self._raise_if_cancelled("任务已取消，停止校验验证码")
         try:
             self._last_otp_validation_code = str(code or "").strip()
             self._last_otp_validation_status_code = None
@@ -2223,11 +2309,13 @@ class RegistrationEngine:
         用于规避邮箱里历史验证码导致的 400（第一次取到旧码，第二次取新码）。
         """
         # 每轮验证码阶段开始前，清理上轮 OTP 校验缓存，避免 continue_url/workspace 被旧阶段污染。
+        self._raise_if_cancelled(f"任务已取消，停止{stage_label}校验")
         self._last_validate_otp_continue_url = None
         self._last_validate_otp_workspace_id = None
         if attempted_codes is None:
             attempted_codes = set()
         for attempt in range(1, max_attempts + 1):
+            self._raise_if_cancelled(f"任务已取消，停止{stage_label}重试")
             code = (
                 self._get_verification_code(timeout=fetch_timeout)
                 if fetch_timeout
@@ -2239,7 +2327,7 @@ class RegistrationEngine:
                         f"{stage_label}第 {attempt}/{max_attempts} 次未取到验证码，稍后重试...",
                         "warning",
                     )
-                    time.sleep(2)
+                    self._sleep_interruptible(2)
                     continue
                 return False
 
@@ -2257,7 +2345,7 @@ class RegistrationEngine:
                     if self._validate_verification_code(code):
                         return True
                     if attempt < max_attempts:
-                        time.sleep(2)
+                        self._sleep_interruptible(2)
                         continue
                     return False
 
@@ -2266,7 +2354,7 @@ class RegistrationEngine:
                         f"{stage_label}第 {attempt}/{max_attempts} 次命中重复验证码 {code}，等待新邮件...",
                         "warning",
                     )
-                    time.sleep(2)
+                    self._sleep_interruptible(2)
                     continue
                 return False
 
@@ -2280,12 +2368,13 @@ class RegistrationEngine:
                     f"{stage_label}第 {attempt}/{max_attempts} 次校验未通过，疑似旧验证码，自动重试下一封...",
                     "warning",
                 )
-                time.sleep(2)
+                self._sleep_interruptible(2)
 
         return False
 
     def _create_user_account(self) -> bool:
         """创建用户账户"""
+        self._raise_if_cancelled("任务已取消，停止创建用户账户")
         try:
             user_info = generate_random_user_info()
             self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
@@ -2348,6 +2437,7 @@ class RegistrationEngine:
 
     def _get_workspace_id(self) -> Optional[str]:
         """获取 Workspace ID"""
+        self._raise_if_cancelled("任务已取消，停止获取 Workspace ID")
         try:
             def _extract_workspace_id(payload: Any) -> str:
                 if not isinstance(payload, dict):
@@ -2443,6 +2533,7 @@ class RegistrationEngine:
 
     def _select_workspace(self, workspace_id: str) -> Optional[str]:
         """选择 Workspace"""
+        self._raise_if_cancelled("任务已取消，停止选择 Workspace")
         try:
             select_body = f'{{"workspace_id":"{workspace_id}"}}'
 
@@ -2507,6 +2598,7 @@ class RegistrationEngine:
 
     def _follow_redirects(self, start_url: str) -> Tuple[Optional[str], str]:
         """手动跟随重定向链，返回 (callback_url, final_url)。"""
+        self._raise_if_cancelled("任务已取消，停止跟随重定向")
         try:
             def _is_oauth_callback(url: str) -> bool:
                 try:
@@ -2527,6 +2619,7 @@ class RegistrationEngine:
             max_redirects = 12
 
             for i in range(max_redirects):
+                self._raise_if_cancelled("任务已取消，停止跟随重定向")
                 self._log(f"重定向 {i+1}/{max_redirects}: {current_url[:100]}...")
                 if _is_oauth_callback(current_url) and not callback_url:
                     callback_url = current_url
@@ -2595,6 +2688,7 @@ class RegistrationEngine:
 
     def _handle_oauth_callback(self, callback_url: str) -> Optional[Dict[str, Any]]:
         """处理 OAuth 回调"""
+        self._raise_if_cancelled("任务已取消，停止处理 OAuth 回调")
         try:
             if not self.oauth_start:
                 self._log("OAuth 流程未初始化", "error")
@@ -2614,7 +2708,7 @@ class RegistrationEngine:
             self._log(f"处理 OAuth 回调失败: {e}", "error")
             return None
 
-    def run(self) -> RegistrationResult:
+    def _run_primary_registration(self) -> RegistrationResult:
         """
         执行完整的注册流程
 
@@ -2626,6 +2720,7 @@ class RegistrationEngine:
         Returns:
             RegistrationResult: 注册结果
         """
+        self._raise_if_cancelled("任务已取消，停止注册流程")
         result = RegistrationResult(success=False, logs=self.logs)
 
         try:
@@ -2653,6 +2748,7 @@ class RegistrationEngine:
 
             # 1. 检查 IP 地理位置
             self._log("1. 先看看这条网络从哪儿来，别一开局就站错片场...")
+            self._raise_if_cancelled("任务已取消，停止注册流程")
             ip_ok, location = self._check_ip_location()
             if not ip_ok:
                 result.error_message = f"IP 地理位置不支持: {location}"
@@ -2663,6 +2759,7 @@ class RegistrationEngine:
 
             # 2. 创建邮箱
             self._log("2. 开个新邮箱，准备收信...")
+            self._raise_if_cancelled("任务已取消，停止注册流程")
             if not self._create_email():
                 result.error_message = "创建邮箱失败"
                 return result
@@ -2670,6 +2767,7 @@ class RegistrationEngine:
             result.email = self.email
 
             # 3. 准备首轮授权流程
+            self._raise_if_cancelled("任务已取消，停止注册流程")
             did, sen_token = self._prepare_authorize_flow("首次授权")
             if not did:
                 result.error_message = "获取 Device ID 失败"
@@ -2681,6 +2779,7 @@ class RegistrationEngine:
 
             # 4. 提交注册入口邮箱
             self._log("4. 递上邮箱，看看 OpenAI 这球怎么接...")
+            self._raise_if_cancelled("任务已取消，停止注册流程")
             signup_result = self._submit_signup_form(did, sen_token)
             if not signup_result.success:
                 result.error_message = f"提交注册表单失败: {signup_result.error_message}"
@@ -2690,28 +2789,33 @@ class RegistrationEngine:
                 self._log("检测到这是老朋友账号，直接切去登录拿 token，不走弯路")
             else:
                 self._log("5. 设置密码，别让小偷偷笑...")
-                password_ok, _ = self._register_password(did, sen_token)
+                self._raise_if_cancelled("任务已取消，停止注册流程")
+                password_ok, _ = self._register_password_with_retry(did, sen_token)
                 if not password_ok:
                     result.error_message = self._last_register_password_error or "注册密码失败"
                     return result
 
                 self._log("6. 催一下注册验证码出门，邮差该冲刺了...")
+                self._raise_if_cancelled("任务已取消，停止注册流程")
                 if not self._send_verification_code():
                     result.error_message = "发送验证码失败"
                     return result
 
                 self._log("7. 等验证码飞来，邮箱请注意查收...")
                 self._log("8. 对一下验证码，看看是不是本人...")
+                self._raise_if_cancelled("任务已取消，停止注册流程")
                 if not self._verify_email_otp_with_retry(stage_label="注册验证码", max_attempts=3):
                     result.error_message = "验证验证码失败"
                     return result
 
                 self._log("9. 给账号办个正式户口，名字写档案里...")
+                self._raise_if_cancelled("任务已取消，停止注册流程")
                 if not self._create_user_account():
                     result.error_message = "创建用户账户失败"
                     return result
 
                 if effective_entry_flow in {"native", "outlook"}:
+                    self._raise_if_cancelled("任务已取消，停止注册流程")
                     login_ready, login_error = self._restart_login_flow()
                     if not login_ready:
                         result.error_message = login_error
@@ -2722,13 +2826,16 @@ class RegistrationEngine:
                     self._log("注册入口链路: ABCard（新账号不重登，直接抓取会话）")
 
             if effective_entry_flow == "native":
+                self._raise_if_cancelled("任务已取消，停止注册流程")
                 if not self._complete_token_exchange_native_backup(result):
                     return result
             elif effective_entry_flow == "outlook":
+                self._raise_if_cancelled("任务已取消，停止注册流程")
                 if not self._complete_token_exchange_outlook(result):
                     return result
             else:
                 use_abcard_entry = (effective_entry_flow == "abcard") and (not self._is_existing_account)
+                self._raise_if_cancelled("任务已取消，停止注册流程")
                 if not self._complete_token_exchange(result, require_login_otp=not use_abcard_entry):
                     return result
 
@@ -2771,7 +2878,175 @@ class RegistrationEngine:
             result.error_message = str(e)
             return result
 
-    def save_to_database(self, result: RegistrationResult) -> bool:
+    def _build_anyauto_fallback_result(
+        self,
+        flow_result: Optional[Dict[str, Any]],
+        primary_error: str = "",
+    ) -> RegistrationResult:
+        """Map PR60 AnyAuto V2 output into the current RegistrationResult structure."""
+        result = RegistrationResult(success=False, logs=self.logs)
+        result.email = str(self.email or "")
+        result.password = str(self.password or "")
+        result.device_id = str(self.device_id or "")
+
+        if not flow_result or not flow_result.get("success"):
+            fallback_error = str((flow_result or {}).get("error_message") or "注册失败").strip()
+            if primary_error and fallback_error and fallback_error != primary_error:
+                result.error_message = f"{primary_error} | anyauto fallback: {fallback_error}"
+            else:
+                result.error_message = fallback_error or primary_error or "注册失败"
+            result.metadata = {
+                "registration_flow": "any-auto-register-fallback",
+                "fallback_attempted": True,
+                "primary_error": primary_error,
+                "fallback_success": False,
+            }
+            return result
+
+        result.success = True
+        result.access_token = str(flow_result.get("access_token") or "")
+        result.refresh_token = str(flow_result.get("refresh_token") or "")
+        result.id_token = str(flow_result.get("id_token") or "")
+        result.session_token = str(flow_result.get("session_token") or "")
+        result.account_id = str(flow_result.get("account_id") or "")
+        result.workspace_id = str(flow_result.get("workspace_id") or "")
+        result.source = "register"
+
+        if not result.account_id:
+            token_payload = result.access_token or result.id_token
+            result.account_id = str(self._extract_account_id_from_access_token(token_payload) or "").strip()
+        if (not result.account_id) and result.id_token:
+            try:
+                account_info = self.oauth_manager.extract_account_info(result.id_token)
+                result.account_id = str(account_info.get("account_id") or "").strip()
+            except Exception:
+                pass
+
+        settings = get_settings()
+        client_id = str(
+            getattr(settings, "openai_client_id", "")
+            or getattr(self.oauth_manager, "client_id", "")
+            or ""
+        ).strip()
+        metadata = dict(flow_result.get("metadata") or {})
+        metadata.update(
+            {
+                "email_service": self.email_service.service_type.value,
+                "proxy_used": self.proxy_url,
+                "registered_at": datetime.now().isoformat(),
+                "registration_flow": "any-auto-register-fallback",
+                "fallback_attempted": True,
+                "primary_error": primary_error,
+                "client_id": client_id,
+                "device_id": result.device_id,
+                "has_session_token": bool(result.session_token),
+                "has_access_token": bool(result.access_token),
+                "has_refresh_token": bool(result.refresh_token),
+            }
+        )
+        result.metadata = metadata
+        return result
+
+    def _run_anyauto_fallback(self, primary_error: str = "") -> RegistrationResult:
+        """Run the PR60 AnyAuto V2 engine as a controlled fallback."""
+        self._raise_if_cancelled("任务已取消，停止回退注册流程")
+        settings = get_settings()
+        max_retries = int(getattr(settings, "registration_max_retries", 3) or 3)
+        browser_mode = str(
+            getattr(settings, "registration_anyauto_browser_mode", "protocol") or "protocol"
+        ).strip()
+
+        flow_engine = AnyAutoRegistrationEngine(
+            email_service=self.email_service,
+            proxy_url=self.proxy_url,
+            callback_logger=self._log,
+            max_retries=max_retries,
+            browser_mode=browser_mode or "protocol",
+            extra_config=None,
+        )
+        flow_result = flow_engine.run()
+
+        self.email_info = flow_engine.email_info
+        self.email = flow_engine.email
+        self.inbox_email = flow_engine.inbox_email
+        self.password = flow_engine.password
+        self.session = flow_engine.session
+        self.device_id = flow_engine.device_id
+
+        fallback_result = self._build_anyauto_fallback_result(flow_result, primary_error=primary_error)
+        if fallback_result.session_token:
+            self.session_token = fallback_result.session_token
+        return fallback_result
+
+    def _should_try_anyauto_fallback(self, result: RegistrationResult) -> bool:
+        settings = get_settings()
+        enabled = bool(getattr(settings, "registration_enable_anyauto_fallback", True))
+        if not enabled or result.success:
+            return False
+
+        error_text = str(result.error_message or "").strip().lower()
+        if not error_text:
+            return True
+
+        non_retryable_markers = (
+            "unsupported country",
+            "invalid email service",
+            "email service not found",
+        )
+        if any(marker in error_text for marker in non_retryable_markers):
+            return False
+
+        retryable_markers = (
+            "access_token",
+            "refresh_token",
+            "session",
+            "oauth",
+            "callback",
+            "authorization code",
+            "workspace",
+            "consent",
+            "otp",
+            "verification code",
+            "phone",
+            "add_phone",
+            "add-phone",
+            "sentinel",
+            "failed to create account",
+            "create account",
+            "invalid_request_error",
+            "http 400",
+            "registration failed",
+        )
+        return any(marker in error_text for marker in retryable_markers)
+
+    def run(self) -> RegistrationResult:
+        """Run the current primary flow first, then selectively fall back to PR60 AnyAuto V2."""
+        self._raise_if_cancelled("任务已取消，停止注册流程")
+        primary_result = self._run_primary_registration()
+        self._raise_if_cancelled("任务已取消，停止注册流程")
+        if primary_result.success:
+            return primary_result
+
+        if not self._should_try_anyauto_fallback(primary_result):
+            return primary_result
+
+        self._raise_if_cancelled("任务已取消，跳过回退注册流程")
+        primary_error = str(primary_result.error_message or "").strip()
+        self._log("主注册链路未成功，开始尝试 PR60 anyauto V2 回退流程...", "warning")
+        fallback_result = self._run_anyauto_fallback(primary_error=primary_error)
+        if fallback_result.success:
+            self._log("PR60 anyauto V2 回退流程成功，已补上 V2 注册兜底能力")
+            return fallback_result
+
+        self._log(f"PR60 anyauto V2 回退流程也失败了: {fallback_result.error_message}", "warning")
+        return fallback_result
+
+    def save_to_database(
+        self,
+        result: RegistrationResult,
+        account_label: Optional[str] = None,
+        role_tag: Optional[str] = None,
+    ) -> bool:
         """
         保存注册结果到数据库
 
@@ -2806,7 +3081,9 @@ class RegistrationEngine:
                     id_token=result.id_token,
                     proxy_used=self.proxy_url,
                     extra_data=result.metadata,
-                    source=result.source
+                    source=result.source,
+                    account_label=account_label,
+                    role_tag=role_tag,
                 )
 
                 self._log(f"账户已存进数据库，落袋为安，ID: {account.id}")
